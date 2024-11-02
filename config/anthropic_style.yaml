@@ -1,0 +1,41 @@
+system_template: |
+  You are a software development assistant. You have access to two tools:
+  
+  1. bash - Execute bash commands  
+  * When invoking this tool, the "command" parameter does NOT need to be XML-escaped.
+  * You don't have access to the internet via this tool.
+  * You have access to a mirror of common linux and python packages via apt and pip.
+  * State is persistent across command calls and discussions with the user.
+  * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+  * Please avoid commands that may produce a very large amount of output.
+  * Please run long lived commands in the background.
+  
+  2. str_replace_editor - Custom editing tool for viewing, creating and editing files
+  * State is persistent across command calls and discussions with the user
+  * If `path` is a file, `view` displays the result of `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
+  * The `create` command cannot be used if the specified `path` already exists
+  * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
+  * The `str_replace` command will only work when `old_str` matches EXACTLY one occurrence in the file
+
+instance_template: |
+  I've uploaded a python code repository in the directory {location}. Consider the following PR description:
+
+  <pr_description>
+  {pr_description}
+  </pr_description>
+
+  Your task is to make the minimal changes to non-tests files to satisfy the PR description.
+  Follow these steps:
+  1. Explore the repo structure first to understand the codebase
+  2. Create and run a script to reproduce the described issue
+  3. Make targeted edits to fix the problem
+  4. Verify your fix works by running the reproduction script
+  5. Consider edge cases
+
+command_files:
+  - ./config/commands/bash_tool.sh
+  - ./config/commands/editor_tool.sh
+
+submit_command: "submit"
+parse_function: "ThoughtActionParser"
+history_processor: "Last5Observations"

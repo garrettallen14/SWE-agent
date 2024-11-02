@@ -1008,6 +1008,8 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
         or args.model_name in OpenAIModel.SHORTCUTS
     ):
         return OpenAIModel(args, commands)
+    elif args.model_name in ["anthropic/claude-3.5-sonnet", "google/gemini-flash-1.5-8b"]:
+        return OpenRouterModel(args, commands)
     elif args.model_name.startswith("claude"):
         return AnthropicModel(args, commands)
     elif args.model_name.startswith("bedrock"):
@@ -1020,8 +1022,132 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
         return TogetherModel(args, commands)
     elif args.model_name in GroqModel.SHORTCUTS:
         return GroqModel(args, commands)
+    elif args.model_name in OpenRouterModel.MODELS:
+        return OpenRouterModel(args, commands)
     elif args.model_name == "instant_empty_submit":
         return InstantEmptySubmitTestModel(args, commands)
     else:
         msg = f"Invalid model name: {args.model_name}"
         raise ValueError(msg)
+
+
+# 1. Model Registration
+# In models.py
+
+import requests
+
+class OpenRouterModel(BaseModel):
+    MODELS = {
+        "google/gemini-flash-1.5-8b": {
+            "max_context": 128_000,
+            "cost_per_input_token": 0.0000001,
+            "cost_per_output_token": 0.0000002,
+            "max_tokens": 4096,
+        },
+        "anthropic/claude-3.5-sonnet": {
+            "max_context": 200_000,
+            "max_tokens": 4096,
+            "cost_per_input_token": 3e-06,
+            "cost_per_output_token": 1.5e-05,
+        }
+    }
+
+    def __init__(self, args: ModelArguments, commands: list[Command]):
+        super().__init__(args, commands)
+        self.client = self._setup_client()
+        
+    def _setup_client(self) -> requests.Session:
+        """Setup the HTTP client for OpenRouter"""
+        session = requests.Session()
+        session.headers.update({
+            "Authorization": f"Bearer {keys_config['OPENROUTER_API_KEY']}",
+            "HTTP-Referer": "https://github.com/princeton-nlp/SWE-agent",
+            "X-Title": "SWE-agent",
+            "Content-Type": "application/json"
+        })
+        return session
+
+    def history_to_messages(
+        self,
+        history: list[dict[str, str]],
+        is_demonstration: bool = False,
+    ) -> str | list[dict[str, str]]:
+        """Convert history to OpenRouter format, following Anthropic's pattern"""
+        if is_demonstration:
+            history = [entry for entry in history if entry["role"] != "system"]
+            return "\n".join([entry["content"] for entry in history])
+
+        # Get messages without system
+        messages = [
+            {k: v for k, v in entry.items() if k in ["role", "content"]}
+            for entry in history if entry["role"] != "system"
+        ]
+        
+        # Combine consecutive messages
+        compiled_messages = []
+        last_role = None
+        for message in reversed(messages):
+            if last_role == message["role"]:
+                compiled_messages[-1]["content"] = message["content"] + "\n" + compiled_messages[-1]["content"]
+            else:
+                compiled_messages.append(message)
+            last_role = message["role"]
+        
+        return list(reversed(compiled_messages))
+
+    @retry(
+        wait=wait_random_exponential(min=1, max=15),
+        reraise=True,
+        stop=stop_after_attempt(_MAX_RETRIES),
+        retry=retry_if_not_exception_type((CostLimitExceededError, RuntimeError)),
+    )
+    def query(self, history: list[dict[str, str]]) -> str:
+        """Query OpenRouter API with the given history"""
+        
+        # Get system message
+        system_message = "\n".join([
+            entry["content"] 
+            for entry in history 
+            if entry["role"] == "system"
+        ])
+        
+        # Format messages
+        messages = self.history_to_messages(history)
+        
+        # Create request data
+        data = {
+            "model": self.api_model,
+            "messages": messages,
+            "temperature": self.args.temperature,
+            "top_p": self.args.top_p,
+            "max_tokens": self.model_metadata["max_tokens"]
+        }
+        
+        if system_message:
+            data["system"] = system_message
+            
+        try:
+            # Make request
+            response = self.client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=data
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            
+            # Extract content
+            output = response_data["choices"][0]["message"]["content"]
+            
+            # Update stats
+            self.update_stats(
+                response_data["usage"]["prompt_tokens"],
+                response_data["usage"]["completion_tokens"]
+            )
+            
+            return output
+            
+        except requests.exceptions.RequestException as e:
+            if "context_length_exceeded" in str(e):
+                msg = f"Context window ({self.model_metadata['max_context']} tokens) exceeded"
+                raise ContextWindowExceededError(msg) from e
+            raise
